@@ -1,0 +1,942 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Heating System Analyser</title>
+  <style>
+    body { font-family: sans-serif; margin: 1em; }
+    #controls { margin-top: 1em; }
+    .layer-control, .radiator-controls, .pump-controls { margin-top: 1em; }
+    #svg-container {
+      width: 100%; height: 80vh; border: 1px solid #ccc;
+      overflow: hidden;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+    }
+    #svgDisplay {
+      width: 100%;
+      height: 100%;
+    }
+    #svgDisplay svg {
+      width: 100%;
+      height: 100%;
+      max-width: 100%;
+      max-height: 100%;
+    }
+
+    th, td {
+      padding: 2px;
+    }
+  </style>
+</head>
+<body>
+  <h1>Heating System Analyser</h1>
+  <input type="file" id="svgFile" accept=".svg" />
+  <span id="fileNameDisplay" style="margin-left: 10px;"></span>
+
+  <div id="controls">
+    <h3>Environmental Parameters</h3>
+      <table>
+      <tr>
+        <td>Nominal outdoor temperature (°C)</td>
+        <td class='class_alignRight'><input id='temp_nominal' type='number' value=-10 oninput='updateTemperatureSlider()'>
+      </tr>
+      <tr>
+        <td>No heating outdoor temperature (°C)</td>
+        <td><input id='temp_no_heating' type='number' value=15 oninput='updateTemperatureSlider()'></td>
+      </tr>
+      <tr>
+        <td>Outdoor temperature</td>
+        <td><input id='range_temp' type='range' min='-10' max='15' value='7' oninput='updateTemperatureSlider()' /><span id='range_temp_value'>7 °C</span></td>
+      </tr>
+      </table>
+    <h3>Heating Parameters</h3>
+    <div id='results'>
+        <table>
+          <tr>
+            <td>Basic water volume (l)</td>
+            <td class='class_alignRight'><input id='basic_water_volume' type='number' value=20.6 oninput='updateWaterVolume()'></td><!-- 2x7m DN40 + 3liter in heat exchanger -->
+          </tr>
+          <tr>
+            <td>Available pipe + radiator water volume</td>
+            <td class='class_alignRight'><span id='text_water_volume'></span></td>
+          </tr>
+          <tr>
+            <td><b>Total Available Water Volume</b></td>
+            <td class='class_alignRight'><span id='text_water_volume_sum' style='font-weight:bold;'></span></td>
+          </tr>
+          <tr>
+            <td>Water thermal capacity</td>
+            <td class='class_alignRight'><span id='text_water_capcity'></span></td>
+          </tr>
+          <tr>
+            <td>Heat pump 1 kWh defrosting causes deltaT</td>
+            <td class='class_alignRight'><span id='text_defrost_deltaT'></span></td>
+          </tr>
+        </table>
+        <br>
+        <b>
+        <label>Heat Pump Parameters:<br>
+        <table>
+          <tr>
+            <td>deltaT (K)</td>
+            <td class='class_alignRight'><input id='deltaT' type='number'></td>
+          </tr>
+          <tr>
+            <td>Thermal power</td>
+            <td class='class_alignRight'><span id='text_power_sum'></span></td>
+          </tr>
+          <tr>
+            <td>Flow</td>
+            <td class='class_alignRight'><span id='text_flow_sum'></span></td>
+          </tr>
+        </table>
+        </b>
+    </div>
+
+    <div class='pump-controls'>
+      <label>Water Pump Parameters:<br>
+        <table>
+          <tr>
+            <td>Basic pressure loss (heat exchanger, dirt separator, deaerator) (mBar)</td>
+            <td class='class_alignRight'><input id='basic_pressure_loss' type='number' value=100 oninput='updatePumpPower()'></td>
+          </tr>
+          <tr>
+            <td>Radiator pressure loss (mBar)</td>
+            <td class='class_alignRight'><input id='radiator_pressure_loss' type='number' value=40 oninput='updateRadiators()'></td>
+          </tr>
+          <tr>
+            <td>Max total pressure loss</td>
+            <td class='class_alignRight'><span id='text_max_total_pressure_loss'></span> mBar</td>
+          </tr>
+          <tr>
+            <td>Water pump power</td>
+            <td class='class_alignRight'><span id='text_pump_power'></span> W</td>
+          </tr>
+        </table>
+      </label>
+    </div>
+    <br>
+    <div id='scenes'>
+    <button onclick="setScene('MIN')">Set all to 0%</button>
+    <button onclick="setScene('BATHROOM')">Set bathrooms to 100%</button>
+    <button onclick="setScene('MAX')">Set all to 100%</button>
+    </div>
+    <div id='radiatorInputs'></div>
+    <div id='pipeResults'></div>
+
+    <h3>Layer Opacity Controls</h3>
+    <div id='layerControls'></div>
+
+  </div>
+
+  <div id='svg-container'>
+    <div id='svgDisplay'></div>
+  </div>
+    Version: 1.0
+  <script src='constants.js'></script>
+  <script src='pressureCalculation.js'></script>
+  <script>
+    // 1. Upload svg wiht heating system (pump, pipes, radiators)
+    // 2. Parse to logical representation
+    // 3. Radiator reference power becomes basis for mass flow and pressure calculation
+
+    // Initial values
+    let radiators = [];
+    let nodes = {};
+    let edges = [];
+
+    let calcTimeout = null;
+
+    let power_ref_sum = 0;
+    let power_sum = 0;
+    let power_relative = 1.0;
+    let sys = { water_volume: 0 };
+    let deltaT = 5;
+    let sourceNode = 0;  // pump is source node
+    let pump_x = 0;
+    let pump_y = 0;
+
+    // Function to reset to initial values
+    function resetToInitialValues() {
+        radiators = [];
+        nodes = {};
+        edges = [];
+
+        calcTimeout = null;
+
+        power_ref_sum = 0;
+        power_sum = 0;
+        power_relative = 1.0;
+        sys = { water_volume: 0 };
+        deltaT = 5;
+        document.getElementById('deltaT').value = deltaT;
+        sourceNode = 0;  // pump is source node
+        pump_x = 0;
+        pump_y = 0;
+    }
+
+    document.getElementById('deltaT').addEventListener('input', e => {deltaT = e.target.value; updateRadiators();});
+
+    // pressure in Pascal, q in m³/h)
+    function pumpCurve(pressure, q) {
+      const efficiency = 0.4;
+      const p_mech = q * pressure/10000 * rho_water /367;
+      const p_el = p_mech / efficiency;
+      return p_el;
+    }
+
+    function updatePumpPower() {
+      sys.basic_pressure_loss = parseFloat(document.getElementById('basic_pressure_loss').value)*100;  // mBar to Pascal
+      const radiator_pressure_loss = parseFloat(document.getElementById('radiator_pressure_loss').value)*100;  // mBar to Pascal
+      const pressure = sys.basic_pressure_loss - sys.min_pressure + radiator_pressure_loss;
+      document.getElementById('text_max_total_pressure_loss').textContent = (pressure/100).toFixed(0);
+
+      const p_el = pumpCurve(pressure, sys.flow_sum_l_per_h/1000);
+      document.getElementById('text_pump_power').textContent = p_el.toFixed(1);
+    }
+
+    const inkscapeNS = "http://www.inkscape.org/namespaces/inkscape";
+
+    window.addEventListener('DOMContentLoaded', () => {
+      fetch('demo.svg')
+        .then(response => response.text())
+        .then(svgText => {
+          document.getElementById("fileNameDisplay").textContent = "demo.svg";
+          processSVG(svgText);
+        })
+        .catch(error => {
+          console.error("Failed to load default SVG:", error);
+        });
+    });
+
+    document.getElementById("svgFile").addEventListener("change", (event) => {
+      const file = event.target.files[0];
+      document.getElementById("fileNameDisplay").textContent = file.name;
+
+      const reader = new FileReader();
+      reader.onload = () => {
+        const svgText = reader.result;
+        processSVG(svgText);
+      };
+      reader.readAsText(file);
+    });
+
+
+    function processSVG(svgText) {
+
+      const parser = new DOMParser();
+      const doc = parser.parseFromString(svgText, "image/svg+xml");
+      const svgRoot = doc.documentElement;
+
+      if (!svgRoot.hasAttribute("viewBox")) {
+        const width = parseFloat(svgRoot.getAttribute("width")) || 1000;
+        const height = parseFloat(svgRoot.getAttribute("height")) || 1000;
+        svgRoot.setAttribute("viewBox", `0 0 ${width} ${height}`);
+      }
+      svgRoot.setAttribute("preserveAspectRatio", "xMidYMid meet");
+      svgRoot.setAttribute("style", "width: 100%; height: auto; display: block;");
+
+      const importedSvg = document.importNode(svgRoot, true);
+      const svgContainer = document.getElementById("svgDisplay");
+      // 🧹 Clear old SVG
+      svgContainer.innerHTML = '';
+      resetToInitialValues();
+      // ✅ Insert new SVG
+      svgContainer.appendChild(importedSvg);
+
+      setupLayerControls(importedSvg);
+      processElements(importedSvg);
+    }
+
+
+    function setupLayerControls(svgRoot) {
+      const layers = svgRoot.querySelectorAll("g");
+      const controlsDiv = document.getElementById("layerControls");
+      controlsDiv.innerHTML = '';
+
+      layers.forEach((layer, index) => {
+        const mode = layer.getAttributeNS(inkscapeNS, "groupmode");
+        const label = layer.getAttributeNS(inkscapeNS, "label");
+        if (mode === "layer" && label) {
+          const id = `layer_${index}`;
+          layer.setAttribute("id", id);
+          const control = document.createElement("div");
+          control.className = "layer-control";
+          control.innerHTML = `
+            <label>${label}
+              <input type="range" min="0" max="100" value="100"
+                     oninput="document.getElementById('${id}').style.opacity = this.value / 100; this.parentElement.querySelector('.opacity-value').textContent = this.value;" />
+              <span class="opacity-value">100</span> %
+            </label>
+          `;
+          controlsDiv.appendChild(control);
+        }
+      });
+    }
+
+
+    function processElements(svgRoot) {
+      const svgScale = getSvgScale(svgRoot) * 1.0415 * 2.54 / 10;  // mm per unit  // todo: why 1.0415
+      console.log(`SVG Scale Factor: ${svgScale.toFixed(4)} mm/unit`);
+
+      const paths = svgRoot.querySelectorAll("path, circle, ellipse");
+      const radiatorInputsDiv = document.getElementById("radiatorInputs");
+      radiatorInputsDiv.innerHTML = '';
+
+      /*****************************************/
+      /*** Build the graph:                    */
+      /***   Pipes and radiators become edges  */
+      /***   Coordinates become nodes          */
+      /*****************************************/
+
+      /*****************************/
+      /*** Find pump coordinates ***/
+      /*****************************/
+      paths.forEach(path => {
+
+        const label = path.getAttribute('inkscape:label') || path.getAttribute('id');
+
+        if (label?.includes('_pump')) {
+
+            const bbox = path.getBBox();
+            pump_x = bbox.x;
+            pump_y = bbox.y;
+            console.log('pump_x', pump_x, 'pump_y', pump_y);
+        }
+      });
+
+      paths.forEach(path => {
+
+        const label = path.getAttribute('inkscape:label') || path.getAttribute('id');
+
+        // Search for <desc> child element content
+        let desc = '';
+        const descElement = path.querySelector('desc');
+        if (descElement && descElement.textContent) {
+          desc = descElement.textContent.trim();
+        }
+
+
+        /******************/
+        /*** Find pipes ***/
+        /******************/
+
+        if (label?.includes('pipe') || label?.includes('_vertical')) {
+
+          let layer = "(no layer)";
+          if (label?.includes('_vertical')) {
+            let match = desc.match(/layer=["']?([^"']+)["']?/);
+            layer = match ? match[1] : null;
+
+          } else {
+            // Traverse up to find the layer/group this element belongs to
+            let group = path.closest("g");
+            layer = group?.getAttributeNS(inkscapeNS, "label") || "(no layer)";
+          }
+
+          //const pipeMatch = desc.match(/d_inner=\d+(\.\d+)?mm/);  // todo check all units
+          const pipeMatch = desc.match(/d_inner=([\d.]+)mm/);
+          const heightMatch = desc.match(/height=([\d.]+)m/);
+
+          if (!pipeMatch){
+            console.warn('Parser error d_inner for', label);
+            return;
+          }
+
+          const d_inner = parseFloat(pipeMatch[1])/1000;
+
+          let len = 0;
+          if (label.includes('_vertical') && heightMatch) {
+            len = parseFloat(heightMatch[1]); // already in meters
+          } else if (label.includes('pipe')) {
+            len = path.getTotalLength() * svgScale;
+          } else {
+            console.warn('Parser error', label);
+          }
+
+          const directionChanges = countDirectionChanges(path);
+
+          // Save for graph-based branching logic
+          let [pt1, pt2] = getPathEndpoints(path);
+
+          if (label?.includes('_vertical')) {
+            var [layer1, layer2] = layer.split(",");
+          } else {
+            var [layer1, layer2] = [layer, layer];
+          }
+
+          const node1 = findOrCreateNode(pt1, nodes, layer1);
+          const node2 = findOrCreateNode(pt2, nodes, layer2);
+
+          volume = len * Math.PI*(d_inner/2)**2;
+          const edge = { from: node1, to: node2, layer: layer, type: 'pipe', flow: 0.0, d_inner: d_inner, directionChanges: directionChanges, len: len, volume: volume, loss: 0, label, path };
+          edges.push(edge);
+          nodes[node1].edges.push(edge);
+          nodes[node2].edges.push(edge);
+
+          console.log(`Detected ${label}: diameter=${d_inner}, length=${len.toFixed(2)}m, elbows=${directionChanges}`);
+          //annotatePath(path, `${totalLoss.toFixed(2)} mBar`);
+        }
+      });
+
+
+      /*******************************/
+      /*** Find radiators and pump ***/
+      /*******************************/
+      let html = `<table border=1 style="border-collapse: collapse" class="cl_rad_ctrl"><tr>
+            <th>Label</th>
+            <th>Type</th>
+            <th>Volume</th>
+            <th>Power ref</th>
+            <th>Level</th>
+            <th>%</th>
+            <th>Power</th>
+            <th>Flow</th>
+            <th>Flow speed</th>
+            <th>Pressure Loss</th>
+            <th>Pipe Pressure Loss</th></tr>`;
+
+      paths.forEach(path => {
+
+        const label = path.getAttribute('inkscape:label') || path.getAttribute('id');
+
+        // Traverse up to find the layer/group this element belongs to
+        let group = path.closest("g");
+        let layer = group?.getAttributeNS(inkscapeNS, "label") || "(no layer)";
+
+        // Search for <desc> child element content
+        let desc = '';
+        const descElement = path.querySelector('desc');
+        if (descElement && descElement.textContent) {
+          desc = descElement.textContent.trim();
+        }
+
+        let nearestNode = null;
+        let nearestDistance = Infinity;
+
+        if (label?.includes('pump') && !label?.includes('pipe')) {
+
+          const bbox = path.getBBox();
+
+          Object.keys(nodes).forEach(node => {
+              const [x1, y1] = node.split('_')[1].split(',').map(Number);
+              const dist = Math.hypot(x1 - bbox.x, y1 - bbox.y);
+              if (nodes[node].layer === layer && dist < nearestDistance) {
+                nearestDistance = dist;
+                nearestNode = node;
+              }
+          });
+
+          if (nearestNode) {
+            sourceNode = nearestNode;
+            console.log(`Pump ${label} connected to nearest node: ${nearestNode} (distance=${nearestDistance.toFixed(2)})`);
+          } else {
+            console.warn(`Pump ${label} has no nearestNode.`);
+          }
+
+        } else if (desc.includes("type=")) {  // radiator or underfloor heating
+
+          const typeMatch = desc.match(/type=["']?([^\n\r"']+)["']?/);
+          const type = typeMatch ? typeMatch[1] : "unknown";
+
+          // parse power
+          const p_match = desc.match(/p=(\d+)/);
+          const p_ref = p_match ? parseFloat(p_match[1]) : 0;
+          power_ref_sum += p_ref;
+
+          const bbox = path.getBBox();
+
+          let rad_type_text;
+          let radiatorKey;
+          let volume = 0;
+
+          if (type.includes('floor')) {
+              const d_inner = parseFloat(desc.match(/d_inner=([\d.]+)mm/)[1])/1000;
+              let len = parseFloat(desc.match(/len=([\d.]+)m/)[1]);
+              volume = len * Math.PI*(d_inner/2)**2;
+              const match = desc.match(/conn_len_oneway=([\d.]+)m/);
+              if (match) {
+                conn_len_oneway = parseFloat(match[1]);
+                const conn_d_inner = parseFloat(desc.match(/conn_d_inner=([\d.]+)mm/)[1])/1000;
+                volume += 2*conn_len_oneway * Math.PI*(conn_d_inner/2)**2;
+                // todo: calc connection loss
+              }
+
+              radiatorKey = `${type}_${d_inner*1000}mm_${len}m`;
+              rad_type_text = radiatorKey;
+
+              const c_match = desc.match(/conn=["']?([^\n\r"']+)["']?/);
+              const conn_node_name = c_match[1];
+
+              Object.keys(nodes).some(function(node) {
+                 const rects = svgRoot.querySelectorAll("rect");
+                 rects.forEach(rect => {
+                      const rect_label = rect.getAttribute('inkscape:label') || rect.getAttribute('id');
+                      if (rect_label == conn_node_name) {
+                        let [pt1, pt2] = getPathEndpoints(rect);
+                        // Traverse up to find the layer/group this element belongs to
+                        let group = rect.closest("g");
+                        layer = group?.getAttributeNS(inkscapeNS, "label") || "(no layer)";
+                        nearestNode = findOrCreateNode(pt1, nodes, layer);
+                        return true;
+                      }
+                 });
+              });
+
+          } else {
+              const heightMatch = desc.match(/height=(\d+)mm/);
+              const height = heightMatch ? parseInt(heightMatch[1]) : 600;
+              const longSide = Math.max(bbox.width, bbox.height);
+              radiatorKey = `${type}_${height}x${Math.round(longSide*svgScale*10)*100}`;
+              volume = radiatorVolumeTable[radiatorKey] || 0.003;  // 3 liter default
+
+              rad_type_text = radiatorVolumeTable[radiatorKey]
+                ? `<span style="color:#00b140">${radiatorKey}</span>`
+                : radiatorKey;
+
+             Object.keys(nodes).forEach(node => {
+                  const [x1, y1] =  node.split('_')[1].split(',').map(Number);
+                  const dist = Math.hypot(x1 - bbox.x, y1 - bbox.y);
+                  if (nodes[node].layer === layer && dist < nearestDistance) {
+                    nearestDistance = dist;
+                    nearestNode = node;
+                  }
+              });
+
+              // search in vicinity of other end of radiator
+              Object.keys(nodes).forEach(node => {
+                  const [x1, y1] =  node.split('_')[1].split(',').map(Number);
+                  const dist = Math.hypot(x1 - (bbox.x+bbox.width), y1 - (bbox.y+bbox.height));
+                  if (nodes[node].layer === layer && dist < nearestDistance) {
+                    nearestDistance = dist;
+                    nearestNode = node;
+                  }
+              });
+          }
+
+          html += `<tr>
+            <td>${label}</td>
+            <td>${rad_type_text}</td>
+            <td>${(volume*1000).toFixed(1)}</span> l</td>
+            <td><span class="p_ref-value">${p_ref}</span> W</td>
+            <td><input id="RAD_${label}" type="range" min="0" max="100" value="100" oninput="updateLoss(this)"/></td>
+            <td><span class="power-percent">100</span> %</td>
+            <td><span class="p-value">${p_ref}</span> W</td>
+            <td><span class="flow-value">0</span> l/h</td>
+            <td><span class="speed-value">0</span> m/s</td>
+            <td><span id="pressureLoss_RAD_${label}">0</span> mBar</td>
+            <td><span id="pipe-pressure_RAD_${label}">0</span> mBar</td>
+          </tr>`
+
+          if (nearestNode) {
+            console.log(`Radiator ${label} connected to nearest pipe: ${nearestNode} (distance=${nearestDistance.toFixed(2)})`);
+          } else {
+            console.warn(`Radiator ${label} has no nearestNode.`);
+          }
+
+          const radNode = `RAD_${label}`;
+          if (!nodes[radNode]) nodes[radNode] = { pressure: null, edges: [] };
+
+          const edge = { from: nearestNode, to: radNode, layer: layer, type: 'radiator', p_ref: p_ref, p: p_ref, flow: 0, volume: volume, loss: 0, label, path };
+
+          edges.push(edge);
+          nodes[nearestNode].edges.push(edge);
+          radiators.push({ label, radiatorKey, nearestNode, type, p_ref, path });
+
+          // virtual node for radiator end
+          nodes[radNode].edges.push(edge);
+        }
+      });
+
+      const div = document.createElement("div");
+      div.className = "radiator-controls";
+
+      html += `<tr>
+        <th>Show Pipe Table<input type='checkbox' id='cb_pipeTable' onchange='pipeTableCheckbox(this)'/></th>
+      </tr>
+      <tr class='pipeTable'>
+        <th></th>
+        <th>Inner Diameter</th>
+        <th>Twoway Volume</th>
+        <th>Oneway Length</th>
+        <th></th>
+        <th></th>
+        <th>Power</th>
+        <th>Flow</th>
+        <th>Flow speed</th>
+        <th>Twoway Loss</th>
+      </tr>`;
+
+      // Generate Pipe Table
+      for (const edge of edges) {
+        if (edge.type === 'pipe') {
+          html += `<tr class='pipeTable'>
+            <td>${edge.label}</td>
+            <td><span id="${edge.label}_d_inner-value">0</span> mm</td>
+            <td><span id="${edge.label}_volume-value">0</span> l</td>
+            <td><span id="${edge.label}_len-value">0</span> m</td>
+            <td></td>
+            <td></td>
+            <td><span id="${edge.label}_power-value">0</span> W</td>
+            <td><span id="${edge.label}_flow-value">0</span> l/h</td>
+            <td><span id="${edge.label}_speed-value">0</span> m/s</td>
+            <td><span id="${edge.label}_pressureLoss-value">0</span> mBar</td>
+          </tr>`
+        }
+      }
+
+      div.innerHTML = html + "</table>";
+      radiatorInputsDiv.appendChild(div);
+
+      const cb = document.querySelectorAll('input[id^="cb_pipeTable"]');
+      cb[0].dispatchEvent(new Event('change'));
+
+      console.log('radiators', radiators);
+      console.log('nodes', nodes);
+      console.log('edges', edges);
+
+      //drawEdges(svgRoot, edges);
+
+      // === Build routes for each radiator ===
+      const edgeMap = new Map();
+      for (const edge of edges) {
+        const key = `${edge.from}-${edge.to}`;
+        edgeMap.set(key, edge);
+        edgeMap.set(`${edge.to}-${edge.from}`, edge); // For reverse lookups
+      }
+
+      function findRoute(fromNode, toNode) {
+        const visited = new Set();
+        const queue = [{ node: fromNode, path: [] }];
+
+        while (queue.length > 0) {
+          const { node, path } = queue.shift();
+          if (node === toNode) return path;
+
+          visited.add(node);
+          for (const edge of nodes[node].edges) {
+            const nextNode = edge.from === node ? edge.to : edge.from;
+            if (!visited.has(nextNode)) {
+              queue.push({
+                node: nextNode,
+                path: [...path, edge]
+              });
+            }
+          }
+        }
+        return [];
+      }
+
+      for (const edge of edges) {
+        if (edge.type === 'radiator') {
+          edge.route = findRoute(edge.from, sourceNode);
+          if (edge.route.length == 0) {
+            console.warn('Could not find route for', edge.to)
+          }
+        }
+      }
+
+      updateTemperatureSlider();
+    }
+
+
+function getPathEndpoints(path) {
+  if (typeof path.getPointAtLength !== 'function') return [];
+
+  try {
+    const totalLength = path.getTotalLength();
+    if (totalLength === 0) return [];
+
+    const startPoint = path.getPointAtLength(0);
+    const endPoint = path.getPointAtLength(totalLength);
+
+    return [startPoint, endPoint];
+  } catch (e) {
+    console.warn('Could not compute endpoints for path:', path, e);
+    return [];
+  }
+}
+
+
+function pipeTableCheckbox(checkboxElem)
+{
+    var lst = document.getElementsByClassName('pipeTable');
+    for(var i = 0; i < lst.length; ++i) {
+        lst[i].style.display = checkboxElem.checked ? '' : 'none';
+    }
+}
+
+
+function updateWaterVolume()
+{
+  sys.basic_water_volume = parseFloat(document.getElementById('basic_water_volume').value)/1000;
+  water_volume_sum = sys.basic_water_volume + sys.water_volume;
+  kWh_per_K = water_volume_sum*rho_water*c_water/3600/1000;
+  document.getElementById('text_water_volume_sum').innerHTML = (water_volume_sum*1000).toFixed(1) + ' l';
+  document.getElementById('text_water_capcity').innerHTML = kWh_per_K.toFixed(3) + ' kWh/K';
+  document.getElementById('text_defrost_deltaT').innerHTML = (1/kWh_per_K).toFixed(1) + ' K';
+}
+
+
+function updateResult(importedSvg) {
+  let p_sum = 0;
+  for (const radiatorEdge of edges) {
+    if (radiatorEdge.type !== 'radiator') continue;
+    radiatorEdge.flow = radiatorEdge.p / (c_water * deltaT);  // kg/s
+    p_sum += radiatorEdge.p;
+  }
+
+  flow_sum = p_sum / (c_water * deltaT);  // kg/s
+  sys.flow_sum_l_per_h = 1000 * flow_sum / rho_water * 3600;  // l/h
+
+  //nodes[sourceNode].pressure = 100;  // Assume 100 mBar at the source
+  calculatePressureLoss(importedSvg, sys, nodes, edges, sourceNode);
+
+  document.getElementById('text_power_sum').innerHTML = p_sum.toFixed(0) + ' W';
+  document.getElementById('text_flow_sum').innerHTML = sys.flow_sum_l_per_h.toFixed(0) + ' l/h';
+  document.getElementById('text_water_volume').innerHTML = (sys.water_volume*1000).toFixed(1) + ' l';
+
+  updateWaterVolume();
+
+  // update pressure in table
+  let min_pressure = 0;
+  let min_pressure_text_object;
+  const pressure_values = document.querySelectorAll('span[id^="pipe-pressure_RAD_"]');
+  pressure_values.forEach(pressure_value => {
+      Object.keys(nodes).forEach(key => {
+        if (pressure_value.id.includes( key)) {
+            if (nodes[key].pressure < min_pressure) {
+                min_pressure = nodes[key].pressure;
+                min_pressure_text_object = pressure_value;
+            }
+            pressure_value.textContent = -2* (nodes[key].pressure /100).toFixed(1);  // total for forward and return pipe
+        }
+      });
+      pressure_value.style.fontWeight = 'normal';  // reset to normal
+  });
+
+  if (min_pressure_text_object) min_pressure_text_object.style.fontWeight = 'bold';
+
+  sys.min_pressure = 2*min_pressure;  // total for forward and return pipe
+  updatePumpPower();
+
+  // update pipes and const pressure in table
+  let max_edge_loss = 0;
+  let id_max_edge_loss;
+  for (const edge of edges) {
+    if (edge.type !== 'pipe') {
+      document.getElementById(`pressureLoss_${edge.to}`).textContent = parseFloat(document.getElementById('radiator_pressure_loss').value);  // mBar
+    } else {
+      const flow_l_per_h = 1000 * edge.flow / rho_water * 3600;  // l/h
+      const v = edge.flow / rho_water / (Math.PI*(edge.d_inner/2)**2);
+      document.getElementById(`${edge.label}_d_inner-value`).textContent = edge.d_inner*1000;
+      document.getElementById(`${edge.label}_len-value`).textContent = edge.len.toFixed(1);
+      document.getElementById(`${edge.label}_volume-value`).textContent = (edge.volume*2*1000).toFixed(1);
+      document.getElementById(`${edge.label}_power-value`).textContent = (edge.flow * (c_water * deltaT)).toFixed(0);
+      document.getElementById(`${edge.label}_flow-value`).textContent = flow_l_per_h.toFixed(0);
+      document.getElementById(`${edge.label}_speed-value`).textContent = v.toFixed(2);
+      document.getElementById(`${edge.label}_speed-value`).style.color = (v > 1.5) ? 'red' : 'black';  // avoid > 1.5m/s
+      document.getElementById(`${edge.label}_pressureLoss-value`).textContent = (2*edge.loss/100).toFixed(1);  // mBar; total for forward and return pipe
+      if (edge.loss > max_edge_loss) {
+          max_edge_loss = edge.loss;
+          id_max_edge_loss = `${edge.label}_pressureLoss-value`;
+      }
+      document.getElementById(`${edge.label}_pressureLoss-value`).style.fontWeight = 'normal';
+    }
+  }
+  if (id_max_edge_loss) document.getElementById(`${id_max_edge_loss}`).style.fontWeight = 'bold';
+}
+
+
+function setScene(scene)
+{
+    const sliders = document.querySelectorAll('input[id^="RAD_"]');
+    sliders.forEach(slider => {
+      if (   scene=='MAX'
+          || scene=='BATHROOM' && (slider.id.includes('bath') || slider.id.includes('Bath') )) {
+        slider.value = 100;
+      } else {
+        slider.value = 0;
+      }
+    });
+    updateRadiators();
+}
+
+
+function updateTemperatureSlider()
+{
+  temp_nominal = document.getElementById('temp_nominal').value;
+  temp_no_heating = document.getElementById('temp_no_heating').value;
+  temp_outdoor = document.getElementById('range_temp').value;
+
+  power_relative = (temp_no_heating-temp_outdoor) / (temp_no_heating-temp_nominal);
+
+  document.getElementById('range_temp').min = temp_nominal;
+  document.getElementById('range_temp').max = temp_no_heating;
+  document.getElementById('range_temp_value').textContent = temp_outdoor + ' °C ' + (power_relative*100).toFixed(0) + ' %';
+
+  updateRadiators();
+}
+
+
+function updateRadiators()
+{
+  // Select all slider inputs with IDs starting with 'RAD_'
+  const sliders = document.querySelectorAll('input[id^="RAD_"]');
+  sliders.forEach(slider => {
+    // Trigger the 'input' event to simulate user interaction
+    slider.dispatchEvent(new Event('input'));
+  });
+}
+
+
+function updateLoss(input) {
+  const percent = parseInt(input.value);
+
+  for (const edge of edges) {
+    if (edge.to === input.id) {
+      edge.p = power_relative * percent/100 * edge.p_ref;
+      edge.flow = edge.p / (c_water * deltaT);  // kg/s
+      const v = edge.flow / rho_water / (Math.PI*(d_radiator_pipe/2)**2);
+
+      flow_l_per_h = 1000 * edge.flow / rho_water * 3600;  // l/h
+
+      input.parentElement.parentElement.querySelector(".power-percent").textContent = percent.toFixed(0);
+      input.parentElement.parentElement.querySelector(".p-value").textContent = edge.p.toFixed(0);
+      input.parentElement.parentElement.querySelector(".flow-value").textContent = flow_l_per_h.toFixed(0);
+      input.parentElement.parentElement.querySelector(".speed-value").textContent = v.toFixed(2);
+      input.parentElement.parentElement.querySelector(".speed-value").style.color = (v > 0.5) ? 'red' : 'black';   // avoid > 0.5m/s
+    }
+  }
+
+  // Debounced heavy calculation
+  if (calcTimeout) {
+    clearTimeout(calcTimeout);
+  }
+  calcTimeout = setTimeout(() => {
+  updateResult();
+  }, 200); // 0.2 seconds debounce
+}
+
+
+function annotatePath(path, text) {
+  const svgNS = 'http://www.w3.org/2000/svg';
+  let parent = path;
+
+  // Traverse up to find the layer group <g inkscape:groupmode="layer">
+  while (parent && parent.tagName !== 'svg') {
+    if (
+      parent.tagName === 'g' &&
+      parent.getAttribute('inkscape:groupmode') === 'layer'
+    ) {
+      break;
+    }
+    parent = parent.parentNode;
+  }
+
+  if (!parent || parent.tagName !== 'g') {
+    console.warn('Layer group not found for annotation');
+    return;
+  }
+
+  const bbox = path.getBBox();
+  const textEl = document.createElementNS(svgNS, 'text');
+  const strokeWidth = parseFloat(path.getAttribute('stroke-width')) || 1;
+  const fontSize = strokeWidth * 2;
+  textEl.setAttribute('x', bbox.x + bbox.width / 2);
+  textEl.setAttribute('y', bbox.y + bbox.height / 2);
+  textEl.setAttribute('font-size', fontSize);
+  textEl.setAttribute('fill', 'red');
+  textEl.setAttribute('style', 'pointer-events: none; user-select: none;');
+  textEl.textContent = text;
+
+  parent.appendChild(textEl);
+}
+
+
+function drawEdges(svgRoot, edges) {
+  const svgNS = "http://www.w3.org/2000/svg";
+
+  edges.forEach(({ path }) => {
+      let parent = path;
+
+      // Traverse up to find the layer group <g inkscape:groupmode="layer">
+      while (parent && parent.tagName !== 'svg') {
+        if (
+          parent.tagName === 'g' &&
+          parent.getAttribute('inkscape:groupmode') === 'layer'
+        ) {
+          break;
+        }
+        parent = parent.parentNode;
+      }
+
+      if (!parent || parent.tagName !== 'g') {
+        console.warn('Layer group not found for adding line');
+        return;
+      }
+
+    if (!path || typeof path.getTotalLength !== "function") return;
+
+    const total = path.getTotalLength();
+    const p1 = path.getPointAtLength(0);
+    const p2 = path.getPointAtLength(total);
+
+    const line = document.createElementNS(svgNS, "line");
+
+    // Use getComputedStyle to handle cases where stroke-width is not an attribute
+    const computedStyle = window.getComputedStyle(path);
+    const strokeWidthStr = computedStyle.getPropertyValue('stroke-width');
+    const strokeWidth = parseFloat(strokeWidthStr) || 3;
+
+    line.setAttribute("x1", p1.x);
+    line.setAttribute("y1", p1.y);
+    line.setAttribute("x2", p2.x);
+    line.setAttribute("y2", p2.y);
+    line.setAttribute("stroke", "red");
+    line.setAttribute("stroke-width", strokeWidth);
+    line.setAttribute("opacity", "0.6");
+
+    parent.appendChild(line);
+  });
+}
+
+
+    function getSvgScale(svg) {
+      const vb = svg.getAttribute('viewBox');
+      const widthAttr = svg.getAttribute('width');
+      const heightAttr = svg.getAttribute('height');
+
+      if (!vb || (!widthAttr && !heightAttr)) return 1; // default fallback
+
+      const [vbX, vbY, vbWidth, vbHeight] = vb.split(/\s+|,/).map(Number);
+
+      function parseLength(value) {
+        if (!value) return null;
+        const mm = parseFloat(value);
+        if (value.endsWith('mm')) return mm;
+        if (value.endsWith('cm')) return mm * 10;
+        if (value.endsWith('in')) return mm * 25.4;
+        if (value.endsWith('px')) return null; // px can't be converted reliably
+        return null;
+      }
+
+      const physicalWidth = parseLength(widthAttr);
+      const physicalHeight = parseLength(heightAttr);
+
+      let scale = 1;
+
+      if (physicalWidth && vbWidth) {
+        scale = physicalWidth / vbWidth; // mm per SVG unit
+      } else if (physicalHeight && vbHeight) {
+        scale = physicalHeight / vbHeight;
+      }
+
+      return scale;
+    }
+  </script>
+</body>
+</html>
+
